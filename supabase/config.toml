@@ -1,0 +1,11 @@
+# Supabase CLI settings for the BugFlix server. `supabase start` and
+# `supabase db reset` load the migration, the starter pack and every Pro pack.
+project_id = "bugflix"
+
+[db.seed]
+enabled = true
+sql_paths = ["./seed.sql", "./packs/*.sql"]
+
+# Stripe calls the webhook with its own signature, not a Supabase JWT.
+[functions.stripe-webhook]
+verify_jwt = false

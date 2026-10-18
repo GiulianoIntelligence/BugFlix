@@ -1,0 +1,11 @@
+{
+  "name": "bugflix",
+  "version": "0.1.0",
+  "description": "Binge-worthy AI trivia in a side pane while Claude codes. Pops up when Claude starts working, pauses the moment it finishes.",
+  "author": { "name": "GiulianoIntelligence" },
+  "homepage": "https://github.com/GiulianoIntelligence/BugFlix",
+  "repository": "https://github.com/GiulianoIntelligence/BugFlix",
+  "license": "MIT",
+  "keywords": ["game", "trivia", "fun", "leaderboard", "multiplayer"],
+  "types": "./types/index.d.ts"
+}
