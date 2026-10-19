@@ -14,7 +14,7 @@ Pro is $4.99/month. After Stripe's card fee (about 2.9% + 30¢ in the US) and St
 
 Freemium developer tools commonly convert a few percent of active users. Three ways to move the numbers:
 
-- **Annual plan** ($39/year, about 35% off): cash up front and much lower churn. Add a second Payment Link; the webhook already handles it.
+- **Annual plan** ($39/year, about 35% off): cash up front and much lower churn. Add a yearly price to the BugFlix Pro product and turn on Stripe's upsell from the monthly price to it (or allow plan switching in the customer portal). The existing Payment Link then offers annual billing and still passes the player id, so the webhook needs no change. Don't share a separate Payment Link outside the mod: a purchase made without the mod's `client_reference_id` can't be matched to a player, so the buyer would never get Pro.
 - **Team rooms**: rooms are Pro-only to create, so a team lead pays and the whole team plays. A later "Team" price (say $19/month for a room of 10) is a natural upsell.
 - **Sponsored packs**: AI tool companies want developers to learn their APIs. A sponsored pack ("This week's MCP pack, brought to you by …") is a separate income line that doesn't depend on conversion. A handful of sponsors at a few hundred dollars each could matter more than subscriptions early on.
 
@@ -28,8 +28,8 @@ Freemium developer tools commonly convert a few percent of active users. Three w
 
 1. Make the repository public so `/plugin install bugflix --marketplace GiulianoIntelligence/BugFlix` works for everyone.
 2. Do the owner setup in the README in Stripe **test mode**, then buy Pro with the test card `4242 4242 4242 4242` and check that `/bugflix refresh` shows ✨Pro.
-3. Switch Stripe to live mode: new live keys, a live Payment Link, and the live webhook secret.
-4. Add a short terms-of-service and privacy page and link it from the Payment Link. BugFlix stores only a random token's hash, a handle and scores, and Stripe handles card data.
+3. Switch Stripe to live mode: new live keys, a live Payment Link, the customer portal turned on in live mode, and the live webhook secret. Put the live Payment Link and the live portal login link (no `test_` in the URL) in `src/config.ts`, then ship (README step 4).
+4. Add a short terms-of-service and privacy page and link it from the Payment Link. BugFlix stores a hash of a random token, a handle, scores and per-question answer history with timestamps, room membership and a last-seen time. For Pro players it also stores Stripe customer and subscription IDs, which link the account to Stripe's record of the buyer's email and billing details. Stripe handles all card data.
 5. Record a 20-second screen capture: a prompt, the pane popping up, a correct answer with a 🔥 streak, Claude finishing, the pane vanishing.
 
 ## Getting players

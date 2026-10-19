@@ -27,9 +27,16 @@ function typed(command: string, args: string) {
 
 type FakeOptions = { freeLeft?: number; isDown?: boolean }
 
+type Server = { isDown: boolean; becomePro: () => void }
+
 // The engine beneath the mod, plus a fake BugFlix server behind $.http.fetch
 // that answers the bf_* RPCs the way the migration's functions do.
-function world(on: On, options: FakeOptions = {}) {
+function world(on: On, options: FakeOptions = {}): {
+  clock: ReturnType<typeof mock.clock>
+  panes: Set<string>
+  calls: { fn: string; args: Record<string, unknown>; headers: Record<string, string> }[]
+  server: Server
+} {
   mock.store(on)
   mock.env(on, { BUGFLIX_SUPABASE_URL: 'https://fake.supabase.co', BUGFLIX_SUPABASE_KEY: 'sb_publishable_test' })
   const clock = mock.clock(on, { now: 1_000 })
@@ -68,6 +75,13 @@ function world(on: On, options: FakeOptions = {}) {
   on('ui.status', () => ({ value: undefined }))
   on('ui.toast', () => ({ value: undefined }))
 
+  const server: Server = {
+    isDown: options.isDown ?? false,
+    becomePro: () => {
+      me = { ...me, is_pro: true, free_left: null as unknown as number }
+    },
+  }
+
   on('http.fetch', ($, e) => {
     const fn = e.url.split('/rest/v1/rpc/')[1] ?? ''
     const args = JSON.parse(e.init?.body ?? '{}') as Record<string, unknown>
@@ -75,7 +89,7 @@ function world(on: On, options: FakeOptions = {}) {
     const reply = (status: number, body: unknown) => ({
       value: { status, ok: status < 300, headers: {}, text: JSON.stringify(body) },
     })
-    if (options.isDown) {
+    if (server.isDown) {
       return reply(503, { message: 'upstream unavailable' })
     }
 
@@ -84,7 +98,7 @@ function world(on: On, options: FakeOptions = {}) {
       case 'bf_me':
         return reply(200, me)
       case 'bf_next':
-        return me.free_left === 0
+        return me.free_left === 0 && !me.is_pro
           ? reply(200, { limited: true, card: null, me })
           : reply(200, { limited: false, card: CARD, me })
       case 'bf_answer': {
@@ -117,7 +131,7 @@ function world(on: On, options: FakeOptions = {}) {
     }
   })
 
-  return { clock, panes, calls }
+  return { clock, panes, calls, server }
 }
 
 async function playOne($: Engine, clock: { settle: () => Promise<void> }) {
@@ -153,10 +167,12 @@ describe('online', () => {
     expect(await ui.find({ type: 'Text', text: /19 free left today/ })).toBeDefined()
 
     // A second session signs in with the stored token instead of signing up.
+    const before = w.calls.length
     await $.session.start(START)
     await w.clock.settle()
-    expect(w.calls.filter(call => call.fn === 'bf_register')).toHaveLength(1)
-    expect(w.calls.at(-1)?.fn).toBe('bf_me')
+    const after = w.calls.slice(before).map(call => call.fn)
+    expect(after).toContain('bf_me')
+    expect(after).not.toContain('bf_register')
   })
 
   test('the free limit shows the upgrade, not a question', async ($, on) => {
@@ -190,5 +206,49 @@ describe('online', () => {
     await $.session.start(START)
     await w.clock.settle()
     expect((await $.command.run(typed('bugflix', 'pro'))).text).toMatch(/not on sale/)
+  })
+})
+
+describe('online, fixes from review', () => {
+  test('a waiting server card falls back to the starter pack when the server goes down', async ($, on) => {
+    const w = world(on)
+    const ui = await playOne($, w.clock)
+    expect(await ui.find({ type: 'Text', text: 'HTTP 429 means…' })).toBeDefined()
+
+    w.server.isDown = true
+    const answered = await $.command.run(typed('bugflix', '1'))
+    expect(answered.text).toBeUndefined()
+    expect(await ui.find({ type: 'Text', text: 'HTTP 429 means…' })).toBeUndefined()
+    expect(await ui.find({ key: 'answer-1' })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /Playing offline/ })).toBeDefined()
+
+    // The starter card plays offline.
+    await ui.press({ key: 'answer-1' })
+    expect(await ui.find({ key: 'next' })).toBeDefined()
+  })
+
+  test('the next turn reconnects once the server is back', async ($, on) => {
+    const w = world(on, { isDown: true })
+    const ui = await playOne($, w.clock)
+    expect(await ui.find({ type: 'Text', text: /Playing offline/ })).toBeDefined()
+    await $.turn.complete({ answer: 'Done.', durationMs: 1_000, isAborted: false, turnId: 't1', reason: 'answer' })
+
+    w.server.isDown = false
+    await $.turn.start({ text: 'again', turnId: 't2' })
+    await w.clock.settle()
+    expect(await ui.find({ type: 'Text', text: /🟢 7 playing/ })).toBeDefined()
+  })
+
+  test('paying and pressing refresh brings a question back, not an empty pane', async ($, on) => {
+    const w = world(on, { freeLeft: 0 })
+    const ui = await playOne($, w.clock)
+    await ui.press({ key: 'go-pro' })
+    w.server.becomePro()
+
+    await ui.press({ key: 'refresh' })
+    expect(await ui.find({ type: 'Text', text: /Thank you for keeping BugFlix alive/ })).toBeDefined()
+    await ui.press({ key: 'back' })
+    expect(await ui.find({ type: 'Text', text: 'HTTP 429 means…' })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /Shuffling the deck/ })).toBeUndefined()
   })
 })

@@ -11,6 +11,7 @@ import {
   fetchMe,
   fetchNext,
   hasServer,
+  isUnreachable,
   joinRoom,
   leaveRoom,
   makeToken,
@@ -78,9 +79,9 @@ const HELP = [
 ].join('\n')
 
 // Module state: what a hot reload may forget without harm.
-let isTurnRunning = false
 let poll: Timer | undefined
 let isAnswering = false
+let saving: Promise<unknown> = Promise.resolve()
 
 function isAuth(value: unknown): value is Auth {
   return (
@@ -97,11 +98,20 @@ async function loadAuth($: Engine): Promise<Auth | undefined> {
   return isAuth(saved) ? saved : undefined
 }
 
+// $.store is shared by every Claude Code session on this machine: the
+// running totals come from whichever session wrote last, the card on screen
+// is this session's own. Writes queue, so two in one session never interleave.
 async function setGame($: Engine, change: (state: GameState) => GameState): Promise<GameState> {
-  const after = await update($, game, change)
-  await $.store.set('game', after)
+  const write = saving.then(async () => {
+    const saved = restoreGame(await $.store.get('game'))
+    const after = await update($, game, mine => change({ ...saved, card: mine.card, reveal: mine.reveal }))
+    await $.store.set('game', after)
 
-  return after
+    return after
+  })
+  saving = write.catch(() => undefined)
+
+  return write
 }
 
 async function setNet($: Engine, change: Partial<NetState>): Promise<void> {
@@ -120,8 +130,20 @@ function withServerTotals(state: GameState, me: Me): GameState {
   return { ...state, score: me.total, streak: me.streak, bestStreak: Math.max(state.bestStreak, me.bestStreak) }
 }
 
+// Drawn, that is: a pane opened unasked in a narrow terminal is listed but
+// waits undrawn (isPlaced false) until the person opens it.
 async function isPaneOpen($: Engine): Promise<boolean> {
-  return (await $.ui.panes()).some(pane => pane.id === PANE)
+  return (await $.ui.panes()).some(pane => pane.id === PANE && pane.isPlaced)
+}
+
+// An online card can only be scored by the server; with the server off or
+// unreachable it is dropped for a starter-pack card.
+function isStale(card: Card | null, status: NetState): boolean {
+  return card?.source === 'online' && (status.mode === 'offline' || status.mode === 'error')
+}
+
+async function goOffline($: Engine, error: unknown): Promise<void> {
+  await setNet($, { mode: 'error', note: `Playing offline: ${describeError(error)}` })
 }
 
 // --- the server -------------------------------------------------------------
@@ -155,11 +177,17 @@ async function connect($: Engine): Promise<void> {
     const player = await signIn($)
     await setNet($, { mode: 'online', me: player, note: null, isLimited: false })
     // Online, the server deals: a local card left from offline play goes.
-    await setGame($, state =>
+    const after = await setGame($, state =>
       withServerTotals(state.card?.source === 'local' && state.reveal === null ? { ...state, card: null } : state, player),
     )
+    if (await isPaneOpen($)) {
+      if (after.card === null) {
+        await dealCard($)
+      }
+      await refreshBoard($)
+    }
   } catch (error) {
-    await setNet($, { mode: 'error', note: `Playing offline: ${describeError(error)}` })
+    await goOffline($, error)
   }
 }
 
@@ -203,11 +231,11 @@ function stopPolling(): void {
 // Deals a new card unless one is waiting for an answer.
 async function dealCard($: Engine): Promise<void> {
   const current = await read($, game)
-  if (current.card !== null && current.reveal === null) {
+  const status = await read($, net)
+  if (current.card !== null && current.reveal === null && !isStale(current.card, status)) {
     return
   }
 
-  const status = await read($, net)
   const auth = await loadAuth($)
   if (status.mode === 'online' && auth !== undefined) {
     try {
@@ -223,17 +251,24 @@ async function dealCard($: Engine): Promise<void> {
 
       return
     } catch (error) {
-      // The server is unreachable: keep the fun going on the starter pack.
-      await setNet($, { note: `Offline round: ${describeError(error)}` })
+      if (!isUnreachable(error)) {
+        await setNet($, { note: describeError(error) })
+
+        return
+      }
+      // The server is down: keep the fun going on the starter pack.
+      await goOffline($, error)
     }
   }
 
-  await setGame($, state => deal(state, STARTER_PACK, Math.random))
+  await setGame($, state =>
+    deal(state.card?.source === 'online' && state.reveal === null ? { ...state, card: null } : state, STARTER_PACK, Math.random),
+  )
 }
 
 async function ensureCard($: Engine): Promise<void> {
   const current = await read($, game)
-  if (current.card === null) {
+  if (current.card === null || isStale(current.card, await read($, net))) {
     await dealCard($)
   }
 }
@@ -275,6 +310,12 @@ async function answerSlot($: Engine, slot: number): Promise<string> {
     return summary(await setGame($, state => answerLocal(state, STARTER_PACK, slot, Math.random)))
   }
 
+  if (isStale(card, await read($, net))) {
+    await dealCard($)
+
+    return 'The BugFlix server is offline, so here is a starter-pack question instead.'
+  }
+
   const auth = await loadAuth($)
   if (auth === undefined) {
     return 'Not signed in to the BugFlix server. Try /bugflix refresh.'
@@ -300,6 +341,12 @@ async function answerSlot($: Engine, slot: number): Promise<string> {
 
     return summary(after)
   } catch (error) {
+    if (isUnreachable(error)) {
+      await goOffline($, error)
+      await dealCard($)
+
+      return 'The BugFlix server is unreachable, so here is a starter-pack question instead.'
+    }
     if (error instanceof BackendError && error.code === 'no_pending') {
       // Answered from another terminal: move on.
       await setGame($, state => ({ ...state, card: null, reveal: null }))
@@ -314,11 +361,11 @@ async function answerSlot($: Engine, slot: number): Promise<string> {
 }
 
 async function nextCard($: Engine): Promise<string> {
+  await update($, view, () => 'play')
   const current = await read($, game)
-  if (current.card !== null && current.reveal === null) {
+  if (current.card !== null && current.reveal === null && !isStale(current.card, await read($, net))) {
     return 'Answer this one first: 1-4.'
   }
-  await update($, view, () => 'play')
   await dealCard($)
 
   return 'Next question is up.'
@@ -344,11 +391,10 @@ async function openPane($: Engine): Promise<boolean> {
   return isPlaced
 }
 
+// Closes the pane drawn or not: one waiting undrawn must not appear later.
 async function closePane($: Engine): Promise<void> {
   stopPolling()
-  if (await isPaneOpen($)) {
-    await $.ui.close({ id: PANE })
-  }
+  await $.ui.close({ id: PANE })
 }
 
 async function showPaused($: Engine): Promise<void> {
@@ -478,6 +524,7 @@ async function runCommand($: Engine, args: string): Promise<{ text?: string }> {
 
   const slot = slotFromArg(word)
   if (slot !== undefined) {
+    await update($, view, () => 'play')
     const text = await answerSlot($, slot)
 
     // With the pane in view the answer shows there; the transcript (which
@@ -586,7 +633,13 @@ export const register: Register = on => {
       $.env.get('BUGFLIX_SUPABASE_KEY'),
     ])
     useServer(serverUrl, serverKey)
-    await update($, game, () => restoreGame(savedGame))
+    const restored = restoreGame(savedGame)
+    // A starter question a newer release removed can no longer be scored.
+    const isGone =
+      restored.card?.source === 'local' &&
+      restored.reveal === null &&
+      !STARTER_PACK.some(question => question.id === restored.card?.id)
+    await update($, game, () => (isGone ? { ...restored, card: null } : restored))
     await update($, isEnabled, () => savedEnabled !== false)
     await update($, view, () => 'play')
 
@@ -614,15 +667,16 @@ export const register: Register = on => {
     if (e.agentId !== undefined) {
       return next(e)
     }
-    isTurnRunning = true
     if (await read($, isEnabled)) {
       await showPane($)
       $.clock.after(0, () => {
         void (async () => {
-          await ensureCard($)
-          if (!isTurnRunning) {
-            await closePane($)
+          // Pick up another session's progress, and the server if it is back.
+          await setGame($, state => state)
+          if (hasServer() && (await read($, net)).mode === 'error') {
+            await connect($)
           }
+          await ensureCard($)
         })()
       })
     }
@@ -635,7 +689,6 @@ export const register: Register = on => {
     if (e.agentId !== undefined) {
       return next(e)
     }
-    isTurnRunning = false
     const result = await next(e)
     await closePane($)
     await showPaused($)

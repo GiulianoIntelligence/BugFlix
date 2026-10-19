@@ -27,6 +27,12 @@ do $$
 declare
   alice text := repeat('a', 64);
   bob text := repeat('b', 64);
+  carol text := repeat('c', 64);
+  alice_id uuid;
+  bob_id uuid;
+  carol_id uuid;
+  zone text;
+  served_today integer;
   me jsonb;
   card jsonb;
   reply jsonb;
@@ -118,6 +124,49 @@ begin
   perform pg_temp.expect_error(format('select bf_set_handle(%L, %L)', bob, 'x'), 'bad_handle');
   perform pg_temp.expect_error(format('select bf_set_handle(%L, %L)', bob, 'ASYNCDUCK42'), 'handle_taken');
   perform pg_temp.expect(bf_set_handle(bob, 'RogueLinter7')->>'handle' = 'RogueLinter7', 'rename');
+
+  -- Days are UTC days whatever time zone the caller's request sets (PostgREST
+  -- takes one from a Prefer header). Carol has a card served every 2 hours over
+  -- the last 36, so any other midnight would count a different number of them.
+  carol_id := (bf_register(carol, 'CarolChecks'))->>'id';
+  insert into bf_answers (player_id, question_id, served_at, answered_at, choice, is_correct, points)
+  select carol_id, (select id from bf_questions order by id limit 1), now() - make_interval(hours => h), now() - make_interval(hours => h), 0, false, 0
+  from generate_series(1, 36, 2) as h;
+  select count(*) into served_today from bf_answers
+  where player_id = carol_id and served_at >= date_trunc('day', now(), 'UTC');
+  foreach zone in array array['UTC', 'Etc/GMT-14', 'Etc/GMT+12', 'Asia/Kolkata'] loop
+    perform set_config('timezone', zone, true);
+    perform pg_temp.expect(
+      (bf_me(carol)->>'free_left')::int = greatest(0, bf_free_daily() - served_today),
+      format('free_left counts UTC days under time zone %s', zone)
+    );
+  end loop;
+  perform set_config('timezone', 'UTC', true);
+  perform pg_temp.expect(
+    not exists (
+      select 1 from pg_proc
+      where proname like 'bf\_%' and prosrc ~ 'date_trunc\(''(day|week)'', now\(\)\)'
+    ),
+    'no bf_* function truncates now() in the session time zone'
+  );
+
+  -- Payments, as the stripe-webhook function calls them.
+  select id into alice_id from bf_players where token_hash = bf_hash(alice);
+  select id into bob_id from bf_players where token_hash = bf_hash(bob);
+  update bf_players set is_pro = false where id = alice_id;
+  perform pg_temp.expect(bf_stripe_checkout(alice_id, 'cus_1', 'sub_A', true), 'checkout recorded');
+  perform pg_temp.expect((bf_me(alice)->>'is_pro')::boolean, 'paying makes Pro');
+  perform pg_temp.expect(bf_stripe_checkout(alice_id, 'cus_2', 'sub_B', true), 'a second checkout is recorded too');
+  perform pg_temp.expect(bf_stripe_subscription('sub_B', false), 'sub_B cancelled');
+  perform pg_temp.expect((bf_me(alice)->>'is_pro')::boolean, 'still Pro while sub_A is live');
+  perform bf_stripe_subscription('sub_A', false);
+  perform pg_temp.expect(not (bf_me(alice)->>'is_pro')::boolean, 'no live subscription, no Pro');
+  perform bf_stripe_checkout(alice_id, 'cus_1', 'sub_A', false);
+  perform pg_temp.expect(not (bf_me(alice)->>'is_pro')::boolean, 'a late checkout for a cancelled subscription changes nothing');
+  perform pg_temp.expect(bf_stripe_checkout(bob_id, 'cus_3', null, true), 'lifetime checkout recorded');
+  perform pg_temp.expect((bf_me(bob)->>'is_pro')::boolean, 'lifetime makes Pro');
+  perform pg_temp.expect(not bf_stripe_subscription('sub_unknown', false), 'unknown subscription');
+  perform pg_temp.expect(not bf_stripe_checkout(gen_random_uuid(), 'cus_4', 'sub_C', true), 'unknown player');
 end $$;
 
 -- The anon key reaches the RPCs and nothing else.
@@ -131,6 +180,25 @@ begin
   perform pg_temp.expect_error('update bf_players set is_pro = true', 'permission denied for table bf_players');
   perform pg_temp.expect_error(format('select bf_hash(%L)', 'x'), 'permission denied for function bf_hash');
   perform pg_temp.expect_error(format('select bf_player(%L)', repeat('a', 64)), 'permission denied for function bf_player');
+  perform pg_temp.expect_error(
+    format('select bf_stripe_checkout(%L::uuid, null, null, true)', gen_random_uuid()),
+    'permission denied for function bf_stripe_checkout'
+  );
+  perform pg_temp.expect_error(
+    'select bf_stripe_subscription(''sub_A'', true)',
+    'permission denied for function bf_stripe_subscription'
+  );
+  perform pg_temp.expect_error('select count(*) from bf_subscriptions', 'permission denied for table bf_subscriptions');
+end $$;
+
+reset role;
+
+-- The webhook's role can record payments.
+set local role service_role;
+
+do $$
+begin
+  perform pg_temp.expect(not bf_stripe_subscription('sub_unknown', true), 'service_role calls the payment RPCs');
 end $$;
 
 reset role;

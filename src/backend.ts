@@ -10,10 +10,20 @@ import { CONFIG } from './config'
 export class BackendError extends Error {
   readonly code: string
 
-  constructor(code: string, message: string) {
+  // The HTTP status the server answered with.
+  readonly status: number
+
+  constructor(code: string, message: string, status: number) {
     super(message)
     this.code = code
+    this.status = status
   }
+}
+
+// The server could not be reached or failed (a network error or a 5xx), as
+// opposed to answering no (a 4xx such as no_pending or handle_taken).
+export function isUnreachable(error: unknown): boolean {
+  return !(error instanceof BackendError) || error.status >= 500
 }
 
 export type ServerCard = {
@@ -100,7 +110,7 @@ async function rpc($: EngineInterface, fn: string, args: Record<string, unknown>
 
   if (!response.ok) {
     const message = isRecord(body) && typeof body.message === 'string' ? body.message : `HTTP ${response.status}`
-    throw new BackendError(message, message)
+    throw new BackendError(message, message, response.status)
   }
 
   return body
@@ -120,7 +130,7 @@ function str(value: unknown, fallback = ''): string {
 
 export function toMe(value: unknown): Me {
   if (!isRecord(value) || typeof value.id !== 'string') {
-    throw new BackendError('bad_response', 'The server sent an unexpected answer.')
+    throw new BackendError('bad_response', 'The server sent an unexpected answer.', 200)
   }
   const room = isRecord(value.room) ? { code: str(value.room.code), name: str(value.room.name) } : null
 
@@ -145,7 +155,7 @@ function toCard(value: unknown): ServerCard {
     !Array.isArray(value.choices) ||
     value.choices.length !== 4
   ) {
-    throw new BackendError('bad_response', 'The server sent an unexpected question.')
+    throw new BackendError('bad_response', 'The server sent an unexpected question.', 200)
   }
   const [a, b, c, d] = value.choices.map(choice => str(choice))
   const difficulty = num(value.difficulty, 1)
@@ -170,7 +180,7 @@ export async function fetchMe($: EngineInterface, token: string): Promise<Me> {
 export async function fetchNext($: EngineInterface, token: string): Promise<NextResult> {
   const body = await rpc($, 'bf_next', { p_token: token })
   if (!isRecord(body)) {
-    throw new BackendError('bad_response', 'The server sent an unexpected answer.')
+    throw new BackendError('bad_response', 'The server sent an unexpected answer.', 200)
   }
   const player = toMe(body.me)
 
@@ -187,7 +197,7 @@ export async function submitAnswer(
 ): Promise<AnswerResult> {
   const body = await rpc($, 'bf_answer', { p_token: token, p_question: questionId, p_choice: choice })
   if (!isRecord(body)) {
-    throw new BackendError('bad_response', 'The server sent an unexpected answer.')
+    throw new BackendError('bad_response', 'The server sent an unexpected answer.', 200)
   }
   const correct = num(body.answer)
 
@@ -203,7 +213,7 @@ export async function submitAnswer(
 export async function fetchBoard($: EngineInterface, token: string, scope: 'global' | 'room'): Promise<BoardResult> {
   const body = await rpc($, 'bf_board', { p_token: token, p_scope: scope })
   if (!isRecord(body) || !Array.isArray(body.rows)) {
-    throw new BackendError('bad_response', 'The server sent an unexpected leaderboard.')
+    throw new BackendError('bad_response', 'The server sent an unexpected leaderboard.', 200)
   }
 
   return {

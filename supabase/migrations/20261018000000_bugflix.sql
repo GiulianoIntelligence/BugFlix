@@ -3,8 +3,10 @@
 --
 -- Every table has RLS on and no policy, and anon/authenticated hold no table
 -- privileges: the anon key reaches data only through the SECURITY DEFINER
--- functions at the bottom. Answers are checked here, never in the client, so
--- the leaderboard and the free-tier limit hold even against a modified mod.
+-- functions at the bottom. The server checks every submitted answer and
+-- enforces the free daily limit, on UTC days whatever time zone a caller asks
+-- for. Starter-pack answers ship inside the mod, so points on free questions
+-- are not protected against a modified mod; Pro packs live only here.
 -- A player is a random 64-hex token the mod keeps; only its SHA-256 is stored.
 
 create table public.bf_rooms (
@@ -20,8 +22,7 @@ create table public.bf_players (
   token_hash text not null unique,
   handle text not null check (handle ~ '^[A-Za-z0-9_-]{3,20}$'),
   is_pro boolean not null default false,
-  stripe_customer_id text,
-  stripe_subscription_id text,
+  is_lifetime boolean not null default false,
   room_id uuid references public.bf_rooms (id) on delete set null,
   total integer not null default 0,
   streak integer not null default 0,
@@ -36,7 +37,18 @@ alter table public.bf_rooms
 create unique index bf_players_handle_lower on public.bf_players (lower(handle));
 create index bf_players_last_seen on public.bf_players (last_seen);
 create index bf_players_room on public.bf_players (room_id);
-create index bf_players_stripe_customer on public.bf_players (stripe_customer_id);
+
+-- Stripe subscriptions, one row each. A player who pays twice has two, and is
+-- Pro while any of them is live (or after a one-off, lifetime purchase).
+create table public.bf_subscriptions (
+  id text primary key,
+  player_id uuid not null references public.bf_players (id) on delete cascade,
+  customer_id text,
+  is_live boolean not null,
+  updated_at timestamptz not null default now()
+);
+
+create index bf_subscriptions_player on public.bf_subscriptions (player_id);
 
 create table public.bf_questions (
   id text primary key,
@@ -73,8 +85,10 @@ alter table public.bf_rooms enable row level security;
 alter table public.bf_players enable row level security;
 alter table public.bf_questions enable row level security;
 alter table public.bf_answers enable row level security;
+alter table public.bf_subscriptions enable row level security;
 
-revoke all on public.bf_rooms, public.bf_players, public.bf_questions, public.bf_answers from anon, authenticated;
+revoke all on public.bf_rooms, public.bf_players, public.bf_questions, public.bf_answers, public.bf_subscriptions
+from anon, authenticated;
 
 -- Knobs ---------------------------------------------------------------------
 
@@ -115,13 +129,13 @@ language sql stable as $$
     'total', v.total,
     'weekly', coalesce((
       select sum(a.points) from public.bf_answers a
-      where a.player_id = v.id and a.answered_at >= date_trunc('week', now())
+      where a.player_id = v.id and a.answered_at >= date_trunc('week', now(), 'UTC')
     ), 0),
     'streak', v.streak,
     'best_streak', v.best_streak,
     'free_left', case when v.is_pro then null else greatest(0, public.bf_free_daily() - (
       select count(*) from public.bf_answers a
-      where a.player_id = v.id and a.served_at >= date_trunc('day', now())
+      where a.player_id = v.id and a.served_at >= date_trunc('day', now(), 'UTC')
     )) end,
     'rank_weekly', null,
     'room', (select jsonb_build_object('code', r.code, 'name', r.name) from public.bf_rooms r where r.id = v.room_id)
@@ -180,7 +194,7 @@ begin
 
   if not found then
     if not v.is_pro and (
-      select count(*) from bf_answers a where a.player_id = v.id and a.served_at >= date_trunc('day', now())
+      select count(*) from bf_answers a where a.player_id = v.id and a.served_at >= date_trunc('day', now(), 'UTC')
     ) >= bf_free_daily() then
       return jsonb_build_object('limited', true, 'card', null, 'me', bf_me_json(v));
     end if;
@@ -277,7 +291,7 @@ begin
   with weekly as (
     select p.id, p.handle, p.is_pro, sum(a.points) as score
     from bf_answers a join bf_players p on p.id = a.player_id
-    where a.answered_at >= date_trunc('week', now())
+    where a.answered_at >= date_trunc('week', now(), 'UTC')
       and (p_scope <> 'room' or (v.room_id is not null and p.room_id = v.room_id))
     group by p.id, p.handle, p.is_pro
     having sum(a.points) > 0
@@ -362,14 +376,75 @@ begin
   return bf_me_json(v);
 end $$;
 
+-- Payments (called by the stripe-webhook function with the service role) ---
+
+-- Pro while the player bought lifetime or holds any live subscription.
+create or replace function public.bf_sync_pro(p_player uuid) returns void
+language sql as $$
+  update public.bf_players p
+  set is_pro = p.is_lifetime or exists (
+    select 1 from public.bf_subscriptions s where s.player_id = p.id and s.is_live
+  )
+  where p.id = p_player
+$$;
+
+-- A paid checkout for the player its client_reference_id names. p_subscription
+-- is null for a one-off (lifetime) purchase; p_is_live is the subscription's
+-- status as Stripe reports it now, never as an event recorded it. Returns
+-- false when no such player exists.
+create or replace function public.bf_stripe_checkout(
+  p_player uuid, p_customer text, p_subscription text, p_is_live boolean
+) returns boolean
+language plpgsql security definer set search_path = public as $$
+begin
+  if not exists (select 1 from bf_players where id = p_player) then
+    return false;
+  end if;
+  if p_subscription is null then
+    update bf_players set is_lifetime = true where id = p_player;
+  else
+    insert into bf_subscriptions (id, player_id, customer_id, is_live)
+    values (p_subscription, p_player, p_customer, p_is_live)
+    on conflict (id) do update set is_live = excluded.is_live, updated_at = now();
+  end if;
+  perform bf_sync_pro(p_player);
+  return true;
+end $$;
+
+-- A subscription changed: its status as Stripe reports it now. Returns false
+-- for a subscription no checkout has recorded (yet).
+create or replace function public.bf_stripe_subscription(p_subscription text, p_is_live boolean)
+returns boolean
+language plpgsql security definer set search_path = public as $$
+declare
+  v_player uuid;
+begin
+  update bf_subscriptions set is_live = p_is_live, updated_at = now()
+  where id = p_subscription
+  returning player_id into v_player;
+  if v_player is null then
+    return false;
+  end if;
+  perform bf_sync_pro(v_player);
+  return true;
+end $$;
+
 -- Who may call what ----------------------------------------------------------
 
 revoke execute on function
   public.bf_free_daily(),
   public.bf_hash(text),
   public.bf_player(text),
-  public.bf_me_json(public.bf_players)
+  public.bf_me_json(public.bf_players),
+  public.bf_sync_pro(uuid),
+  public.bf_stripe_checkout(uuid, text, text, boolean),
+  public.bf_stripe_subscription(text, boolean)
 from public, anon, authenticated;
+
+grant execute on function
+  public.bf_stripe_checkout(uuid, text, text, boolean),
+  public.bf_stripe_subscription(text, boolean)
+to service_role;
 
 revoke execute on function
   public.bf_register(text, text),

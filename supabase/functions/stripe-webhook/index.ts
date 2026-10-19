@@ -1,7 +1,8 @@
-// Stripe webhook: keeps bf_players.is_pro in step with payments.
+// Stripe webhook: keeps Pro in step with payments, through the
+// bf_stripe_checkout and bf_stripe_subscription functions in the migration.
 //
 // Deploy:  supabase functions deploy stripe-webhook --no-verify-jwt
-// Secrets: supabase secrets set STRIPE_SECRET_KEY=sk_live_... STRIPE_WEBHOOK_SECRET=whsec_...
+// Secrets: supabase secrets set STRIPE_SECRET_KEY=sk_test_... STRIPE_WEBHOOK_SECRET=whsec_...
 // Stripe:  Developers > Webhooks > add https://<project>.supabase.co/functions/v1/stripe-webhook
 //          for checkout.session.completed, checkout.session.async_payment_succeeded,
 //          customer.subscription.updated and customer.subscription.deleted.
@@ -10,7 +11,7 @@
 import { createClient } from 'npm:@supabase/supabase-js@2.117.2'
 import Stripe from 'npm:stripe@22.6.2'
 
-import { decide } from './handler.ts'
+import { decide, isLive, toRpc } from './handler.ts'
 import type { ProUpdate } from './handler.ts'
 
 const stripe = new Stripe(Deno.env.get('STRIPE_SECRET_KEY') ?? '')
@@ -20,23 +21,19 @@ const supabase = createClient(Deno.env.get('SUPABASE_URL') ?? '', Deno.env.get('
   auth: { persistSession: false },
 })
 
-async function apply(update: ProUpdate): Promise<void> {
-  const query =
-    update.by === 'player'
-      ? supabase
-          .from('bf_players')
-          .update({
-            is_pro: true,
-            stripe_customer_id: update.customerId,
-            stripe_subscription_id: update.subscriptionId,
-          })
-          .eq('id', update.playerId)
-      : supabase.from('bf_players').update({ is_pro: update.isPro }).eq('stripe_subscription_id', update.subscriptionId)
-
-  const { error } = await query
+// Records the update with the subscription's status as Stripe reports it now,
+// so a late or retried event can never undo a newer change. Returns whether a
+// player or subscription row matched.
+async function apply(update: ProUpdate): Promise<boolean> {
+  const isLiveNow =
+    update.subscriptionId === null ? true : isLive((await stripe.subscriptions.retrieve(update.subscriptionId)).status)
+  const { fn, args } = toRpc(update, isLiveNow)
+  const { data, error } = await supabase.rpc(fn, args)
   if (error) {
-    throw new Error(`bf_players update failed: ${error.message}`)
+    throw new Error(`${fn} failed: ${error.message}`)
   }
+
+  return data === true
 }
 
 Deno.serve(async request => {
@@ -63,16 +60,21 @@ Deno.serve(async request => {
   }
 
   const update = decide(event as unknown as Parameters<typeof decide>[0])
-  if (update !== null) {
-    try {
-      await apply(update)
-    } catch (error) {
-      console.error(error)
-
-      // A 5xx makes Stripe retry the event later.
-      return new Response('Update failed', { status: 500 })
-    }
+  if (update === null) {
+    return Response.json({ received: true, applied: false })
   }
 
-  return Response.json({ received: true, applied: update !== null })
+  try {
+    const matched = await apply(update)
+    if (!matched) {
+      console.warn(`${event.type} ${event.id}: no BugFlix player or subscription matched`)
+    }
+
+    return Response.json({ received: true, applied: matched })
+  } catch (error) {
+    console.error(error)
+
+    // A 5xx makes Stripe retry the event later.
+    return new Response('Update failed', { status: 500 })
+  }
 })

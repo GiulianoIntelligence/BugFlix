@@ -104,10 +104,10 @@ BugFlix opens the Payment Link with `?client_reference_id=<player id>`, which is
 
 ```bash
 supabase functions deploy stripe-webhook --no-verify-jwt
-supabase secrets set STRIPE_SECRET_KEY=sk_live_... STRIPE_WEBHOOK_SECRET=whsec_...
+supabase secrets set STRIPE_SECRET_KEY=sk_test_... STRIPE_WEBHOOK_SECRET=whsec_...   # live keys when you go live
 ```
 
-In Stripe, under Developers → Webhooks, add `https://<project-ref>.supabase.co/functions/v1/stripe-webhook` with these events: `checkout.session.completed`, `checkout.session.async_payment_succeeded`, `customer.subscription.updated` and `customer.subscription.deleted`. Paying turns Pro on, and cancelling or failed renewals turn it off.
+In Stripe, under Developers → Webhooks, add `https://<project-ref>.supabase.co/functions/v1/stripe-webhook` with these events: `checkout.session.completed`, `checkout.session.async_payment_succeeded`, `customer.subscription.updated` and `customer.subscription.deleted`. Paying turns Pro on, and cancelling or failed renewals turn it off. The webhook treats each event only as a signal: it asks Stripe for the subscription's current status before it writes anything, so late or retried events can't undo a newer change. A player who pays twice stays Pro until every one of their subscriptions has ended.
 
 ### 4. Ship it
 
@@ -121,10 +121,12 @@ Copy `supabase/packs/001-pro-launch.sql`, give the questions new ids, and run it
 
 ```bash
 claude --plugin-dir .        # run Claude Code with this folder as a plugin; saves hot-reload
-npm test                     # 28 mod tests (claude plugin test) + webhook tests
+npm test                     # 36 mod tests (claude plugin test) + webhook tests
 npm run validate             # claude plugin validate
-npm run check:server         # bf_* behaviour checks against $DATABASE_URL (rolled back)
+npm run check:server         # bf_* behaviour checks; point DATABASE_URL at a throwaway database
 ```
+
+`check:server` runs inside a transaction that it rolls back, but it expects an empty leaderboard, so run it against a local `supabase start` database (`DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:54322/postgres`), not production.
 
 To point the mod at a local `supabase start`, set `BUGFLIX_SUPABASE_URL=http://127.0.0.1:54321` and `BUGFLIX_SUPABASE_KEY=<local anon key>` before launching Claude Code.
 
@@ -143,9 +145,9 @@ To point the mod at a local `supabase start`, set `BUGFLIX_SUPABASE_URL=http://1
 
 ### Security notes
 
-- Players are anonymous: the mod generates a random 64-hex token and the server stores only its SHA-256.
-- Answers are checked on the server, and the client never receives them for online questions. Points, streaks and the free limit can't be faked from a modified client.
-- The starter pack's answers ship in the plugin source, so they're public. That's fine for practice, but leaderboard integrity comes from the daily limit and Pro content.
+- Free players are anonymous: the mod generates a random 64-hex token and the server stores only its SHA-256. Buying Pro links the player to a Stripe customer ID, and Stripe holds the buyer's email and billing details.
+- The server checks every answer, and the client never receives the answer for an online question. The free daily limit is enforced on the server, on UTC days, whatever time zone a request asks for.
+- The starter pack's answers ship in the plugin source, so they're public, and a modified client could always answer free questions correctly. Pro packs live only on the server.
 - The webhook verifies Stripe's signature over the raw body before it trusts anything.
 
 ## License
