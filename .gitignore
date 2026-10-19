@@ -1,11 +1,10 @@
-node_modules
-.next
-out
-public/sw.js
-next-env.d.ts
-*.tsbuildinfo
+node_modules/
+.DS_Store
+*.log
+# Written by Claude Code when it loads the mod from this folder.
+.claude-plugin/types/
+# Supabase CLI state
+supabase/.temp/
+supabase/.branches/
 .env
 .env.*
-!.env.example
-.vercel
-.DS_Store

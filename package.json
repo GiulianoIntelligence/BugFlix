@@ -2,23 +2,14 @@
   "name": "bugflix",
   "version": "0.1.0",
   "private": true,
+  "description": "AI trivia in a Claude Code side pane while Claude works.",
+  "type": "module",
+  "license": "MIT",
+  "engines": { "node": ">=22.18" },
   "scripts": {
-    "sw": "tsc -p tsconfig.sw.json",
-    "dev": "npm run sw && next dev",
-    "build": "npm run sw && next build",
-    "start": "next start",
-    "typecheck": "tsc --noEmit && tsc -p tsconfig.sw.json --noEmit"
-  },
-  "dependencies": {
-    "@mux/mux-player-react": "^3.14.0",
-    "next": "^16.4.2",
-    "react": "^19.3.1",
-    "react-dom": "^19.3.1"
-  },
-  "devDependencies": {
-    "@types/node": "^26.6.5",
-    "@types/react": "^19.3.0",
-    "@types/react-dom": "^19.3.0",
-    "typescript": "^7.0.2"
+    "test": "claude plugin test . && node --test supabase/functions/stripe-webhook/handler_test.ts",
+    "validate": "claude plugin validate .",
+    "seed": "node scripts/build-seed.mjs",
+    "check:server": "psql \"$DATABASE_URL\" -v ON_ERROR_STOP=1 -f supabase/checks/rpc_checks.sql"
   }
 }

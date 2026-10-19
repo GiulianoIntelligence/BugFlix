@@ -1,0 +1,14 @@
+{
+  "name": "bugflix",
+  "description": "BugFlix: AI trivia that plays in a Claude Code side pane while Claude works.",
+  "owner": {
+    "name": "GiulianoIntelligence"
+  },
+  "plugins": [
+    {
+      "name": "bugflix",
+      "source": "./",
+      "description": "Binge-worthy AI trivia in a side pane while Claude codes."
+    }
+  ]
+}
